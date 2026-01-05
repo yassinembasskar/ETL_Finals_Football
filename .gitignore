@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+env/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.dist
+
+# ETL data
+raw/
+transformed/
+logs/
+
+# Secrets
+.env
+
+# Temp / miscellaneous
+*.log
+*.sqlite
+*.db
+*.zip
+*.tar
+*.tmp
+
+# Playwright
+ms-playwright/

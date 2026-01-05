@@ -1,0 +1,45 @@
+# 1️⃣ Base image
+FROM python:3.11-slim
+
+# 2️⃣ Set working directory
+WORKDIR /app
+
+# 3️⃣ System dependencies
+RUN apt-get update && apt-get install -y \
+    chromium \
+    chromium-driver \
+    wget \
+    curl \
+    git \
+    build-essential \
+    libnss3 \
+    libgbm1 \
+    libgtk-3-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# 4️⃣ Copy Python dependencies
+COPY requirements.txt .
+
+# 5️⃣ Install Python dependencies
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt
+
+# 6️⃣ Install Playwright browsers
+RUN pip install --no-cache-dir playwright \
+    && playwright install chromium
+
+# 7️⃣ Optional: Install Jupyter Lab
+RUN pip install --no-cache-dir jupyterlab
+
+# 8️⃣ Copy project files
+COPY . .
+
+# 9️⃣ Set environment variables (optional)
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+# 10️⃣ Expose Jupyter port
+EXPOSE 8888
+
+# 11️⃣ Default command (run Jupyter Lab)
+CMD ["jupyter", "lab", "--ip=0.0.0.0", "--port=8888", "--no-browser", "--allow-root"]
