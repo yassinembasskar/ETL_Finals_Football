@@ -7,7 +7,7 @@ from utils.logging_setup import setup_logger
 logger = setup_logger("playwright_utils", "logs/playwright_utils.log")
 
 
-async def capture_apis(match_url: str, api_prefix: str , headless: bool = False, wait_time: int = 10) -> List[Dict]:
+async def capture_apis(match_url: str, api_prefix: str , headless: bool = True, wait_time: int = 20) -> List[Dict]:
     """
     Launches a Playwright browser, navigates to match_url, and captures API requests/responses.
 
@@ -63,7 +63,7 @@ async def capture_apis(match_url: str, api_prefix: str , headless: bool = False,
 
 
 
-async def scrape_html(url: str, headless: bool = True, wait_time: int = 10) -> str:
+async def scrape_html(url: str, headless: bool = False, wait_time: int = 20) -> str:
     """
     Navigate to a URL using Playwright and return the page HTML.
 

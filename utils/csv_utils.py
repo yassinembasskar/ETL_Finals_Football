@@ -1,6 +1,18 @@
 import os
 import csv
-from typing import List
+from typing import List, Dict
+
+def read_csv_as_dict(file_path: str) -> List[Dict[str, str]]:
+    """
+    Read a CSV file and return its content as a list of dictionaries.
+    Each row is represented as {column_name: value}.
+    """
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(f"CSV file not found: {file_path}")
+
+    with open(file_path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        return [row for row in reader]
 
 def write_csv_row(file_path: str, headers: List[str], row: List[str]):
     """

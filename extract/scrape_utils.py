@@ -2,12 +2,11 @@
 from typing import List, Dict
 from utils.logging_setup import setup_logger
 from utils.playwright_utils import capture_apis, scrape_html
-import asyncio
 
 # Setup a logger specifically for scraping utilities
 logger = setup_logger("scraping", "logs/scraping.log")
 
-def scrape_sofascore(link: str) -> List[Dict[str, str]]:
+async def scrape_sofascore(link: str) -> List[Dict[str, str]]:
     """
     Scrape data from a Sofascore API or webpage.
 
@@ -24,7 +23,7 @@ def scrape_sofascore(link: str) -> List[Dict[str, str]]:
     try:
         logger.info(f"Starting Sofascore scrape for link: {link}")
 
-        responses = asyncio.run(capture_apis(match_url=link, api_prefix=SOFASCORE_API_PREFIX))
+        responses = await capture_apis(match_url=link, api_prefix=SOFASCORE_API_PREFIX)
 
         logger.info(f"Sofascore scrape completed successfully for link: {link}")
         return responses
@@ -34,7 +33,7 @@ def scrape_sofascore(link: str) -> List[Dict[str, str]]:
         return []
 
 
-def scrape_fbref(link: str) -> str:
+async def scrape_fbref(link: str) -> str:
     """
     Scrape HTML content from a Fbref link.
 
@@ -47,7 +46,7 @@ def scrape_fbref(link: str) -> str:
     try:
         logger.info(f"Starting Fbref scrape for link: {link}")
 
-        html_content = asyncio.run(scrape_html(url=link))
+        html_content = await scrape_html(url=link)
 
         logger.info(f"Fbref scrape completed successfully for link: {link}")
         return html_content
