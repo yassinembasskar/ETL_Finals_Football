@@ -1,36 +1,30 @@
 # utils/connection.py
 import os
-import cx_Oracle
+import psycopg2
 from dotenv import load_dotenv
 from utils.logging_setup import setup_logger
 
-# Load environment variables
 load_dotenv()
 
-# Logger for DB connection
 logger = setup_logger("connection", "logs/connection.log")
 
 def get_connection():
     """
-    Create and return a new Oracle database connection.
+    Create and return a new PostgreSQL database connection.
     """
     try:
-        dsn = cx_Oracle.makedsn(
-            os.getenv("ORACLE_HOST"),
-            os.getenv("ORACLE_PORT"),
-            service_name=os.getenv("ORACLE_SERVICE")
+        conn = psycopg2.connect(
+            host=os.getenv("DB_HOST"),
+            port=os.getenv("DB_PORT", 5432),
+            dbname=os.getenv("DB_NAME"),
+            user=os.getenv("DB_USER"),
+            password=os.getenv("DB_PASSWORD")
         )
-        conn = cx_Oracle.connect(
-            user=os.getenv("ORACLE_USER"),
-            password=os.getenv("ORACLE_PASSWORD"),
-            dsn=dsn
-        )
-        logger.info("✅ Connected to Oracle Database")
+        logger.info("✅ Connected to PostgreSQL Database")
         return conn
-    except cx_Oracle.DatabaseError as e:
-        error, = e.args
-        logger.error(f"❌ Database connection error: {error.message}")
-        raise  # propagate exception so caller knows
+    except psycopg2.OperationalError as e:
+        logger.error(f"❌ Database connection error: {str(e)}")
+        raise
     except Exception as e:
         logger.error(f"❌ Unexpected error: {str(e)}")
         raise

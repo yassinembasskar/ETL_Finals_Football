@@ -5,7 +5,7 @@ import csv
 from datetime import date
 from utils.connection import get_connection
 from utils.logging_setup import setup_logger
-from scrape_utils import scrape_sofascore, scrape_fbref 
+from extract.scrape_utils import scrape_sofascore, scrape_fbref
 from utils.csv_utils import write_csv_row
 
 
@@ -99,7 +99,7 @@ async def scrape_matches_async(
             [match_id, fbref_data]
         )
 
-        cursor.execute("UPDATE matches SET etl_status = 'scraped', last_modified = SYSDATE WHERE id = :1", (match_id,))
+        cursor.execute("UPDATE matches SET etl_status = 'scraped', last_modified = NOW() WHERE id = %s", (match_id,))
         conn.commit()
 
     except Exception as e:
