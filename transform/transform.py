@@ -1,17 +1,3 @@
-"""
-Transform pipeline for match data.
-
-One function per output table, plus a single transform_csv(date_str) entry
-point that iterates the raw CSV, calls every table-function per row,
-concatenates results across all rows, and writes one parquet file per table
-to a date-stamped output directory.
-
-Nested player dicts (in lineups, goals, substitutions, shotmaps, passing
-network actions) are resolved to plain player ids via a shared
-PlayerRegistry, which also builds the final `players` identity table once,
-at the end of the whole run, instead of per-row + dedupe.
-"""
-
 import json
 import os
 import pandas as pd
@@ -19,182 +5,169 @@ import argparse
 import tempfile
 import shutil
 pd.set_option('future.no_silent_downcasting', True)
+from utils.pipeline_state import load_state, save_state, update_transform_state
+from utils.logging_setup import setup_logger
+
+logger = setup_logger("transform", "logs/transform.log")
 
 # ---------------------------------------------------------------------------
 # Player identity extraction + registry
 # ---------------------------------------------------------------------------
 
 def extract_player_id_and_info(player_dict):
-    """
-    Pure function: given a nested player dict (as found in lineups, goals,
-    substitutions, shotmaps, etc.), returns (player_id, identity_row_dict).
-
-    identity_row_dict has the same shape as one row of the `players` table:
-    IdPlayer, Name, Country, marketValue, dateOfBirth, height.
-
-    Does NOT check for existence anywhere -- that's the registry's job.
-    Returns (None, None) if player_dict is missing/NaN (e.g. no goalkeeper
-    on a blocked shot, no assist on a goal).
-    """
     if player_dict is None or (isinstance(player_dict, float) and pd.isna(player_dict)):
         return None, None
 
-    player_id = player_dict.get('id')
-    country = player_dict.get('country') or {}
-    market_value = (player_dict.get('proposedMarketValueRaw') or {}).get('value')
-    dob_ts = player_dict.get('dateOfBirthTimestamp')
+    try:
+        player_id = player_dict.get('id')
+        country = player_dict.get('country') or {}
+        market_value = (player_dict.get('proposedMarketValueRaw') or {}).get('value')
+        dob_ts = player_dict.get('dateOfBirthTimestamp')
 
-    identity_row = {
-        'IdPlayer': player_id,
-        'Name': player_dict.get('name'),
-        'Country': country.get('name'),
-        'marketValue': market_value,
-        'dateOfBirth': pd.to_datetime(dob_ts, unit='s') if dob_ts is not None else None,
-        'height': player_dict.get('height'),
-    }
-    return player_id, identity_row
+        identity_row = {
+            'IdPlayer': player_id,
+            'Name': player_dict.get('name'),
+            'Country': country.get('name'),
+            'marketValue': market_value,
+            'dateOfBirth': pd.to_datetime(dob_ts, unit='s') if dob_ts is not None else None,
+            'height': player_dict.get('height'),
+        }
+        return player_id, identity_row
+    except Exception as e:
+        logger.error(
+            f"extract_player_id_and_info: failed to parse player_dict "
+            f"(keys={list(player_dict.keys()) if isinstance(player_dict, dict) else type(player_dict)}) "
+            f"| {type(e).__name__}: {e}"
+        )
+        raise
 
 
 class PlayerRegistry:
-    """
-    Tracks every unique player_id seen during one transform_csv run, and
-    accumulates their identity rows the first time they're encountered.
-    Scoped per-run only (no cross-run persistence) per current design.
-    """
 
     def __init__(self):
         self._seen_ids = set()
         self._identity_rows = []
 
     def get_or_add(self, player_dict):
-        """
-        Given a nested player dict, returns just the player_id.
-        If this player_id hasn't been seen before in this run, also stores
-        its identity row internally for later retrieval via to_dataframe().
-        Returns None if player_dict is missing/NaN.
-        """
         player_id, identity_row = extract_player_id_and_info(player_dict)
         if player_id is None:
             return None
-        if player_id not in self._seen_ids:
-            self._seen_ids.add(player_id)
-            self._identity_rows.append(identity_row)
+
+        try:
+            if player_id not in self._seen_ids:
+                self._seen_ids.add(player_id)
+                self._identity_rows.append(identity_row)
+        except Exception as e:
+            logger.error(
+                f"PlayerRegistry.get_or_add: failed to register player_id={player_id} | "
+                f"{type(e).__name__}: {e}"
+            )
+            raise
+
         return player_id
 
     def to_dataframe(self):
-        """Returns the accumulated players identity table."""
         if not self._identity_rows:
             return pd.DataFrame(columns=['IdPlayer', 'Name', 'Country',
                                           'marketValue', 'dateOfBirth', 'height'])
         return pd.DataFrame(self._identity_rows).reset_index(drop=True)
 
-
 # ---------------------------------------------------------------------------
 # match
 # ---------------------------------------------------------------------------
 
-def get_full_highlight(highlights_raw):
-    """
-    highlights_raw: the raw JSON string from row['highlights'].
-    Returns the URL of the key/full highlight, or None if there isn't one.
-    """
+def get_full_highlight(highlights_raw, event_id):
     if pd.isna(highlights_raw):
         return None
-    highlights_json = json.loads(highlights_raw)
-    highlights_df = pd.DataFrame(highlights_json['highlights'].tolist()
-                                  if hasattr(highlights_json['highlights'], 'tolist')
-                                  else highlights_json['highlights'])
-    if highlights_df.empty or 'keyHighlight' not in highlights_df.columns:
-        return None
-    key_rows = highlights_df.loc[highlights_df['keyHighlight'] == True, 'url']
-    if key_rows.empty:
-        return None
-    return key_rows.iloc[0]
+
+    try:
+        highlights_json = json.loads(highlights_raw)
+        highlights_df = pd.DataFrame(highlights_json['highlights'].tolist()
+                                      if hasattr(highlights_json['highlights'], 'tolist')
+                                      else highlights_json['highlights'])
+        if highlights_df.empty or 'keyHighlight' not in highlights_df.columns:
+            return None
+        key_rows = highlights_df.loc[highlights_df['keyHighlight'] == True, 'url']
+        if key_rows.empty:
+            return None
+        return key_rows.iloc[0]
+    except Exception as e:
+        logger.warning(f"get_full_highlight: failed to parse highlights for event_id={event_id}, returning None | {type(e).__name__}: {e}")
+        return None        
 
 
 def get_match_table(row):
-    """
-    row: a single-row slice of the raw dataframe (e.g. df.iloc[[i]]).
-    Returns a one-row DataFrame for the `match` table.
-    """
-    return pd.DataFrame([{
-        'event_id': row['event_id'].iloc[0],
-        'competition': row['competition'].iloc[0],
-        'kickoff': row['kickoff'].iloc[0],
-        'home_team_id': row['home_team_id'].iloc[0],
-        'away_team_id': row['away_team_id'].iloc[0],
-        'home_score': row['home_score'].iloc[0],
-        'away_score': row['away_score'].iloc[0],
-        'slug': row['slug'].iloc[0],
-        'custom_id': row['custom_id'].iloc[0],
-        'sofascore_link': row['sofascore_link'].iloc[0],
-        'full_highlight_url': get_full_highlight(row['highlights'].iloc[0]),
-    }])
-
+    event_id = row['event_id'].iloc[0]
+    try:
+        result = pd.DataFrame([{
+            'event_id': event_id,
+            'competition': row['competition'].iloc[0],
+            'kickoff': row['kickoff'].iloc[0],
+            'home_team_id': row['home_team_id'].iloc[0],
+            'away_team_id': row['away_team_id'].iloc[0],
+            'home_score': row['home_score'].iloc[0],
+            'away_score': row['away_score'].iloc[0],
+            'slug': row['slug'].iloc[0],
+            'custom_id': row['custom_id'].iloc[0],
+            'sofascore_link': row['sofascore_link'].iloc[0],
+            'full_highlight_url': get_full_highlight(row['highlights'].iloc[0], event_id),
+        }])
+        logger.info(f"get_match_table: succeeded for event_id={event_id}")
+        return result
+    except Exception as e:
+        logger.error(f"get_match_table: failed for event_id={event_id} | {type(e).__name__}: {e}")
+        raise
 
 # ---------------------------------------------------------------------------
 # team
 # ---------------------------------------------------------------------------
 
 def get_team(team_id, team_name):
-    """Returns a one-row DataFrame for the `team` table."""
     return pd.DataFrame([{'team_id': team_id, 'teamName': team_name}])
-
 
 # ---------------------------------------------------------------------------
 # lineups -> meta-only home/away player frames + long player stats
 # ---------------------------------------------------------------------------
 
 def _get_lineups_players(row, registry):
-    """
-    Parses row['lineups'] and returns:
-        (home_players, home_players_stats, away_players, away_players_stats, formations)
+    event_id = row['event_id'].iloc[0]
+    try:
+        lineups = json.loads(row["lineups"].iloc[0])
+        lineups = pd.DataFrame(lineups)
 
-    home_players / away_players: meta-only frames -- IdPlayer, teamId,
-    jerseyNumber, position, substitute, captain (plus whatever other
-    top-level keys exist on the raw lineup entry; only 'statistics' and
-    'player' are dropped). Raw nested 'player' dict is resolved to IdPlayer
-    via the shared registry.
+        formations = {
+            'home': lineups.loc['formation', 'home'],
+            'away': lineups.loc['formation', 'away'],
+        }
 
-    home_players_stats / away_players_stats: LONG format -- eventId, teamId,
-    playerId, stat_label, stat_value. Built directly from whatever keys
-    exist in each player's statistics dict.
+        home_players = pd.DataFrame(lineups.loc['players', 'home'])
+        away_players = pd.DataFrame(lineups.loc['players', 'away'])
 
-    formations: {'home': ..., 'away': ...}
-    """
-    lineups = json.loads(row["lineups"].iloc[0])
-    lineups = pd.DataFrame(lineups)
+        home_players['IdPlayer'] = home_players['player'].apply(registry.get_or_add)
+        away_players['IdPlayer'] = away_players['player'].apply(registry.get_or_add)
 
-    formations = {
-        'home': lineups.loc['formation', 'home'],
-        'away': lineups.loc['formation', 'away'],
-    }
+        def build_stats_long(players_df, event_id):
+            rows = []
+            for player_id, team_id, stats_dict in zip(players_df['IdPlayer'], players_df['teamId'], players_df['statistics']):
+                if not isinstance(stats_dict, dict):
+                    continue
+                for stat_label, stat_value in stats_dict.items():
+                    if isinstance(stat_value, dict):
+                        continue  # skip nested-dict stats (e.g. ratingVersions) -- not useful for ML
+                    rows.append({'eventId': event_id, 'teamId': team_id, 'playerId': player_id,
+                                 'stat_label': stat_label, 'stat_value': stat_value})
+            return pd.DataFrame(rows, columns=['eventId', 'teamId', 'playerId', 'stat_label', 'stat_value'])
 
-    home_players = pd.DataFrame(lineups.loc['players', 'home'])
-    away_players = pd.DataFrame(lineups.loc['players', 'away'])
+        home_players_stats = build_stats_long(home_players, event_id)
+        away_players_stats = build_stats_long(away_players, event_id)
 
-    home_players['IdPlayer'] = home_players['player'].apply(registry.get_or_add)
-    away_players['IdPlayer'] = away_players['player'].apply(registry.get_or_add)
+        home_players = home_players.drop(columns=['statistics', 'player'])
+        away_players = away_players.drop(columns=['statistics', 'player'])
 
-    def build_stats_long(players_df, event_id):
-        rows = []
-        for player_id, team_id, stats_dict in zip(players_df['IdPlayer'], players_df['teamId'], players_df['statistics']):
-            if not isinstance(stats_dict, dict):
-                continue
-            for stat_label, stat_value in stats_dict.items():
-                if isinstance(stat_value, dict):
-                    continue  # skip nested-dict stats (e.g. ratingVersions) -- not useful for ML
-                rows.append({'eventId': event_id, 'teamId': team_id, 'playerId': player_id,
-                             'stat_label': stat_label, 'stat_value': stat_value})
-        return pd.DataFrame(rows, columns=['eventId', 'teamId', 'playerId', 'stat_label', 'stat_value'])
-
-    home_players_stats = build_stats_long(home_players, row['event_id'].iloc[0])
-    away_players_stats = build_stats_long(away_players, row['event_id'].iloc[0])
-
-    home_players = home_players.drop(columns=['statistics', 'player'])
-    away_players = away_players.drop(columns=['statistics', 'player'])
-
-    return home_players, home_players_stats, away_players, away_players_stats, formations
+        return home_players, home_players_stats, away_players, away_players_stats, formations
+    except Exception as e:
+        logger.error(f"_get_lineups_players: failed for event_id={event_id} | {type(e).__name__}: {e}")
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -203,39 +176,38 @@ def _get_lineups_players(row, registry):
 # ---------------------------------------------------------------------------
 
 def get_match_team(row, formations):
-    """
-    Builds the match_team table: event_id, team_id, isHome, score, formation.
-    """
     event_id = row['event_id'].iloc[0]
-    home_team_id = row['home_team_id'].iloc[0]
-    away_team_id = row['away_team_id'].iloc[0]
-    home_score = row['home_score'].iloc[0]
-    away_score = row['away_score'].iloc[0]
+    try:
+        home_team_id = row['home_team_id'].iloc[0]
+        away_team_id = row['away_team_id'].iloc[0]
+        home_score = row['home_score'].iloc[0]
+        away_score = row['away_score'].iloc[0]
 
-    return pd.DataFrame([
-        {
-            'event_id': event_id,
-            'team_id': home_team_id,
-            'isHome': True,
-            'score': home_score,
-            'formation': formations['home'],
-        },
-        {
-            'event_id': event_id,
-            'team_id': away_team_id,
-            'isHome': False,
-            'score': away_score,
-            'formation': formations['away'],
-        },
-    ])
-
+        return pd.DataFrame([
+            {
+                'event_id': event_id,
+                'team_id': home_team_id,
+                'isHome': True,
+                'score': home_score,
+                'formation': formations['home'],
+            },
+            {
+                'event_id': event_id,
+                'team_id': away_team_id,
+                'isHome': False,
+                'score': away_score,
+                'formation': formations['away'],
+            },
+        ])
+    except Exception as e:
+        logger.error(f"get_match_team: failed for event_id={event_id} | {type(e).__name__}: {e}")
+        raise
 
 # ---------------------------------------------------------------------------
 # match_team_stats (long format: event_id, team_id, stat_name, stat_value)
 # ---------------------------------------------------------------------------
 
 def _build_team_stats_long(groups, side, event_id, team_id):
-    """side = 'home' or 'away'. Returns long-format rows for one team."""
     value_key = f'{side}Value'
     total_key = f'{side}Total'
     rows = []
@@ -264,23 +236,22 @@ def _build_team_stats_long(groups, side, event_id, team_id):
 
 
 def get_match_team_stats(row):
-    """
-    Returns long-format match_team_stats for both home and away teams
-    of this match: columns event_id, team_id, stat_name, stat_value.
-    """
     event_id = row['event_id'].iloc[0]
-    home_team_id = row['home_team_id'].iloc[0]
-    away_team_id = row['away_team_id'].iloc[0]
+    try:
+        home_team_id = row['home_team_id'].iloc[0]
+        away_team_id = row['away_team_id'].iloc[0]
 
-    statistics = json.loads(row['statistics'].iloc[0])
-    statistics_df = pd.DataFrame(statistics['statistics'])
-    groups = statistics_df['groups'].iloc[0]
+        statistics = json.loads(row['statistics'].iloc[0])
+        statistics_df = pd.DataFrame(statistics['statistics'])
+        groups = statistics_df['groups'].iloc[0]
 
-    home_long = _build_team_stats_long(groups, 'home', event_id, home_team_id)
-    away_long = _build_team_stats_long(groups, 'away', event_id, away_team_id)
+        home_long = _build_team_stats_long(groups, 'home', event_id, home_team_id)
+        away_long = _build_team_stats_long(groups, 'away', event_id, away_team_id)
 
-    return pd.concat([home_long, away_long], ignore_index=True)
-
+        return pd.concat([home_long, away_long], ignore_index=True)
+    except Exception as e:
+        logger.error(f"get_match_team_stats: failed for event_id={event_id} | {type(e).__name__}: {e}")
+        raise
 
 # ---------------------------------------------------------------------------
 # match_players (wide: event_id, team_id, IdPlayer + identity-ish match
@@ -288,80 +259,55 @@ def get_match_team_stats(row):
 # ---------------------------------------------------------------------------
 
 def get_match_players(row, home_players, away_players, avg_home_positions, avg_away_positions):
-    """
-    Returns the wide match_players table: one row per player per match,
-    with match-specific identity-ish fields (jerseyNumber, position,
-    substitute, captain) and average position (averageX, averageY).
-
-    home_players/away_players are meta-only frames straight from
-    _get_lineups_players -- IdPlayer is already present, no flattening needed.
-
-    Rows where averageX/averageY are missing are dropped (player did not
-    play, so there's no average position data for them). captain is
-    filled with False where missing and cast to bool.
-    """
     event_id = row['event_id'].iloc[0]
+    try:
+        home = home_players.copy()
+        away = away_players.copy()
 
-    home = home_players.copy()
-    away = away_players.copy()
+        home_avg = pd.json_normalize(avg_home_positions['player']) if 'player' in avg_home_positions else None
+        away_avg = pd.json_normalize(avg_away_positions['player']) if 'player' in avg_away_positions else None
 
-    home_avg = pd.json_normalize(avg_home_positions['player']) if 'player' in avg_home_positions else None
-    away_avg = pd.json_normalize(avg_away_positions['player']) if 'player' in avg_away_positions else None
+        def attach_avg_position(side_df, avg_positions_df, avg_id_df):
+            if avg_id_df is None or avg_positions_df is None or avg_positions_df.empty:
+                side_df = side_df.copy()
+                side_df['averageX'] = 50
+                side_df['averageY'] = 50
+                return side_df
+            avg = avg_positions_df.copy()
+            avg['IdPlayer'] = avg_id_df['id'].values
+            avg = avg.rename(columns={'averageX': 'averageX', 'averageY': 'averageY'})
+            merged = side_df.merge(avg[['IdPlayer', 'averageX', 'averageY']], on='IdPlayer', how='left')
+            merged['averageX'] = merged['averageX'].fillna(50)
+            merged['averageY'] = merged['averageY'].fillna(50)
+            return merged
 
-    def attach_avg_position(side_df, avg_positions_df, avg_id_df):
-        if avg_id_df is None or avg_positions_df is None or avg_positions_df.empty:
-            side_df = side_df.copy()
-            side_df['averageX'] = pd.NA
-            side_df['averageY'] = pd.NA
-            return side_df
-        avg = avg_positions_df.copy()
-        avg['IdPlayer'] = avg_id_df['id'].values
-        avg = avg.rename(columns={'averageX': 'averageX', 'averageY': 'averageY'})
-        merged = side_df.merge(avg[['IdPlayer', 'averageX', 'averageY']], on='IdPlayer', how='left')
-        return merged
+        home = attach_avg_position(home, avg_home_positions, home_avg)
+        away = attach_avg_position(away, avg_away_positions, away_avg)
 
-    home = attach_avg_position(home, avg_home_positions, home_avg)
-    away = attach_avg_position(away, avg_away_positions, away_avg)
+        keep_cols = ['IdPlayer', 'teamId', 'jerseyNumber', 'position', 'substitute',
+                     'captain', 'averageX', 'averageY']
 
-    keep_cols = ['IdPlayer', 'teamId', 'jerseyNumber', 'position', 'substitute',
-                 'captain', 'averageX', 'averageY']
+        home_out = home.reindex(columns=keep_cols)
+        away_out = away.reindex(columns=keep_cols)
 
-    home_out = home.reindex(columns=keep_cols)
-    away_out = away.reindex(columns=keep_cols)
+        out = pd.concat([home_out, away_out], ignore_index=True)
+        out.insert(0, 'event_id', event_id)
 
-    out = pd.concat([home_out, away_out], ignore_index=True)
-    out.insert(0, 'event_id', event_id)
+        out['captain'] = out['captain'].fillna(False).infer_objects(copy=False).astype(bool)
+        out = out.dropna(subset=['averageX', 'averageY'])
 
-    out['captain'] = out['captain'].fillna(False).infer_objects(copy=False).astype(bool)
-    out = out.dropna(subset=['averageX', 'averageY'])
-
-    return out
-
+        return out
+    except Exception as e:
+        logger.error(f"get_match_players: failed for event_id={event_id} | {type(e).__name__}: {e}")
+        raise
 # ---------------------------------------------------------------------------
 # incidents -> goals, cards, substitutions, passing_network
 # ---------------------------------------------------------------------------
-
 def _team_id_from_is_home(is_home_series, home_team_id, away_team_id):
     return is_home_series.map({True: home_team_id, False: away_team_id})
 
 
 def get_passing_network_table(goal_id, network_actions, registry):
-    """
-    Parses one goal's footballPassingNetworkAction list into a long table:
-    goal_id, playerId, type, order, player_coordinates, action_coordinates.
-
-    type: 'assist' if isAssist is True on a pass action, else eventType
-          ('pass', 'goal', etc). A synthesized 'keeper' row is added right
-          after the goal action, using the goal's nested goalkeeper dict.
-
-    Coordinate mapping:
-        pass / assist -> player_coordinates = playerCoordinates,
-                          action_coordinates = passEndCoordinates
-        goal           -> player_coordinates = playerCoordinates,
-                          action_coordinates = goalShotCoordinates
-        keeper         -> player_coordinates = gkCoordinates (from the goal action),
-                          action_coordinates = goalMouthCoordinates
-    """
     if not isinstance(network_actions, list):
         return pd.DataFrame(columns=['goal_id', 'playerId', 'type', 'order',
                                       'player_coordinates', 'action_coordinates'])
@@ -417,114 +363,111 @@ def get_passing_network_table(goal_id, network_actions, registry):
 
 
 def get_incidents_tables(row, registry):
-    """
-    Returns a dict with four DataFrames: 'goals', 'cards', 'substitutions',
-    'passing_network'. Nested player dicts (player, assist1, playerIn,
-    playerOut, goalkeeper) are replaced with _id columns via the shared
-    PlayerRegistry. goal_id/card_id/sub_id come from the original incidents
-    list's own 'id' field.
-    """
     event_id = row['event_id'].iloc[0]
-    home_team_id = row['home_team_id'].iloc[0]
-    away_team_id = row['away_team_id'].iloc[0]
+    try:
+        home_team_id = row['home_team_id'].iloc[0]
+        away_team_id = row['away_team_id'].iloc[0]
 
-    incidents_json = json.loads(row['incidents'].iloc[0])
-    incidents = pd.DataFrame(incidents_json['incidents'])
-    incidents['id'] = incidents['id'].astype('Int64')
+        incidents_json = json.loads(row['incidents'].iloc[0])
+        incidents = pd.DataFrame(incidents_json['incidents'])
+        incidents['id'] = incidents['id'].astype('Int64')
 
-    substitutions = incidents.loc[
-        incidents['incidentType'] == 'substitution',
-        ['id', 'isHome', 'playerIn', 'playerOut', 'injury', 'time', 'addedTime']
-    ].copy().rename(columns={'id': 'sub_id'})
+        substitutions = incidents.loc[
+            incidents['incidentType'] == 'substitution',
+            ['id', 'isHome', 'playerIn', 'playerOut', 'injury', 'time', 'addedTime']
+        ].copy().rename(columns={'id': 'sub_id'})
 
-    cards = incidents.loc[
-        incidents['incidentType'] == 'card',
-        ['id', 'isHome', 'incidentClass', 'time', 'addedTime', 'player']
-    ].copy().rename(columns={'id': 'card_id'})
+        cards = incidents.loc[
+            incidents['incidentType'] == 'card',
+            ['id', 'isHome', 'incidentClass', 'time', 'addedTime', 'player']
+        ].copy().rename(columns={'id': 'card_id'})
 
-    goals = incidents.loc[
-        incidents['incidentType'] == 'goal',
-        ['id', 'isHome', 'homeScore', 'awayScore', 'time', 'addedTime', 'player', 'assist1', 'footballPassingNetworkAction']
-    ].copy().rename(columns={'id': 'goal_id'})
-    goals['hasAssist'] = goals['assist1'].notna()
+        goals = incidents.loc[
+            incidents['incidentType'] == 'goal',
+            ['id', 'isHome', 'homeScore', 'awayScore', 'time', 'addedTime', 'player', 'assist1', 'footballPassingNetworkAction']
+        ].copy().rename(columns={'id': 'goal_id'})
+        goals['hasAssist'] = goals['assist1'].notna()
 
-    if not cards.empty:
-        cards['player_id'] = cards['player'].apply(registry.get_or_add)
-    else:
-        cards['player_id'] = pd.Series(dtype='object')
-    cards = cards.drop(columns=['player'])
-    cards['player_id'] = cards['player_id'].astype('Int64')
+        if not cards.empty:
+            cards['player_id'] = cards['player'].apply(registry.get_or_add)
+        else:
+            cards['player_id'] = pd.Series(dtype='object')
+        cards = cards.drop(columns=['player'])
+        cards['player_id'] = cards['player_id'].astype('Int64')
 
-    if not substitutions.empty:
-        substitutions['playerIn_id'] = substitutions['playerIn'].apply(registry.get_or_add)
-        substitutions['playerOut_id'] = substitutions['playerOut'].apply(registry.get_or_add)
-        substitutions = substitutions.drop(columns=['playerIn', 'playerOut'])
-    
-    cards['isHome'] = cards['isHome'].astype(bool)
+        if not substitutions.empty:
+            substitutions['playerIn_id'] = substitutions['playerIn'].apply(registry.get_or_add)
+            substitutions['playerOut_id'] = substitutions['playerOut'].apply(registry.get_or_add)
+            substitutions = substitutions.drop(columns=['playerIn', 'playerOut'])
 
-    substitutions['isHome'] = substitutions['isHome'].astype(bool)
-    substitutions['injury'] = substitutions['injury'].astype(bool)
+        cards['isHome'] = cards['isHome'].astype(bool)
 
-    goals['isHome'] = goals['isHome'].astype(bool)
+        substitutions['isHome'] = substitutions['isHome'].astype(bool)
+        substitutions['injury'] = substitutions['injury'].astype(bool)
 
-    passing_networks = []
-    goal_team_ids = {}
-    if not goals.empty:
-        goals['player_id'] = goals['player'].apply(registry.get_or_add)
-        goals['assist1_id'] = goals['assist1'].apply(registry.get_or_add)
+        goals['isHome'] = goals['isHome'].astype(bool)
 
-        goal_team_ids = dict(zip(goals['goal_id'], _team_id_from_is_home(goals['isHome'], home_team_id, away_team_id)))
+        passing_networks = []
+        goal_team_ids = {}
+        if not goals.empty:
+            goals['player_id'] = goals['player'].apply(registry.get_or_add)
+            goals['assist1_id'] = goals['assist1'].apply(registry.get_or_add)
 
-        for goal_id, network_actions in zip(goals['goal_id'], goals['footballPassingNetworkAction']):
-            passing_networks.append(get_passing_network_table(goal_id, network_actions, registry))
+            goal_team_ids = dict(zip(goals['goal_id'], _team_id_from_is_home(goals['isHome'], home_team_id, away_team_id)))
 
-        goals = goals.drop(columns=['player', 'assist1', 'footballPassingNetworkAction'])
+            for goal_id, network_actions in zip(goals['goal_id'], goals['footballPassingNetworkAction']):
+                passing_networks.append(get_passing_network_table(goal_id, network_actions, registry))
 
-    if passing_networks:
-        passing_network_df = pd.concat(passing_networks, ignore_index=True)
-    else:
-        passing_network_df = pd.DataFrame(columns=['goal_id', 'playerId', 'type', 'order',
-                                                     'player_coordinates', 'action_coordinates'])
+            goals = goals.drop(columns=['player', 'assist1', 'footballPassingNetworkAction'])
 
-    if not passing_network_df.empty:
-        passing_network_df.insert(0, 'event_id', event_id)
-        passing_network_df['team_id'] = passing_network_df['goal_id'].map(goal_team_ids)
-    
-    passing_network_df['has_action_coordinates'] = passing_network_df['action_coordinates'].notna()
+        if passing_networks:
+            passing_network_df = pd.concat(passing_networks, ignore_index=True)
+        else:
+            passing_network_df = pd.DataFrame(columns=['goal_id', 'playerId', 'type', 'order',
+                                                         'player_coordinates', 'action_coordinates'])
 
+        if not passing_network_df.empty:
+            passing_network_df.insert(0, 'event_id', event_id)
+            passing_network_df['team_id'] = passing_network_df['goal_id'].map(goal_team_ids)
 
-    for df_ in (substitutions, cards, goals):
-        df_.insert(0, 'event_id', event_id)
-        df_['team_id'] = _team_id_from_is_home(df_['isHome'], home_team_id, away_team_id)
+        passing_network_df['has_action_coordinates'] = passing_network_df['action_coordinates'].notna()
 
-    return {'goals': goals, 'cards': cards, 'substitutions': substitutions,
-            'passing_network': passing_network_df}
+        for df_ in (substitutions, cards, goals):
+            df_.insert(0, 'event_id', event_id)
+            df_['team_id'] = _team_id_from_is_home(df_['isHome'], home_team_id, away_team_id)
 
+        return {'goals': goals, 'cards': cards, 'substitutions': substitutions,
+                'passing_network': passing_network_df}
+    except Exception as e:
+        logger.error(f"get_incidents_tables: failed for event_id={event_id} | {type(e).__name__}: {e}")
+        raise
 
 # ---------------------------------------------------------------------------
 # highlights (per match)
 # ---------------------------------------------------------------------------
 
 def get_highlights_table(row):
-    """
-    Returns the highlights table for this match with event_id attached.
-    Filtered to subtitles in key_subtitles (Goal, Chance, Big chance, etc.).
-    """
     event_id = row['event_id'].iloc[0]
-    highlights_str = row['highlights'].iloc[0]
+    empty_result = pd.DataFrame(columns=['event_id', 'title', 'subtitle', 'url', 'createdAtTimestamp'])
 
-    highlights_json = json.loads(highlights_str)
-    highlights = pd.DataFrame(highlights_json)
+    try:
+        highlights_str = row['highlights'].iloc[0]
 
-    key_subtitles = ['Goal', 'Goal (replay)', 'Chance', 'Chance (replay)', 'Big chance', 'Big chance (replay)', 'Cross', 'Goal Disallowed', 'Goal Disallowed (replay)'
-                      'Penalty', 'Penalty (replay)', 'Penalty missed', 'VAR (Replay)', 'Penalty Disallowed (VAR decision)', 'Penalty Disallowed']
+        highlights_json = json.loads(highlights_str)
+        highlights = pd.DataFrame(highlights_json)
 
-    highlights_df = pd.DataFrame(highlights['highlights'].tolist()).sort_values('createdAtTimestamp')
+        key_subtitles = ['Goal', 'Goal (replay)', 'Chance', 'Chance (replay)', 'Big chance', 'Big chance (replay)', 'Cross', 'Goal Disallowed', 'Goal Disallowed (replay)'
+                          'Penalty', 'Penalty (replay)', 'Penalty missed', 'VAR (Replay)', 'Penalty Disallowed (VAR decision)', 'Penalty Disallowed']
 
-    highlights_table = highlights_df.loc[(highlights_df['subtitle'].isin(key_subtitles)), ['title', 'subtitle', 'url', 'createdAtTimestamp']].copy()
-    highlights_table.insert(0, 'event_id', event_id)
+        highlights_df = pd.DataFrame(highlights['highlights'].tolist()).sort_values('createdAtTimestamp')
 
-    return highlights_table
+        highlights_table = highlights_df.loc[(highlights_df['subtitle'].isin(key_subtitles)), ['title', 'subtitle', 'url', 'createdAtTimestamp']].copy()
+        highlights_table.insert(0, 'event_id', event_id)
+
+        return highlights_table
+    except Exception as e:
+        logger.warning(f"get_highlights_table: failed to parse highlights for event_id={event_id}, returning empty table | {type(e).__name__}: {e}")
+        return empty_result
 
 
 # ---------------------------------------------------------------------------
@@ -532,49 +475,51 @@ def get_highlights_table(row):
 # ---------------------------------------------------------------------------
 
 def get_shotmaps_table(row, registry):
-    """
-    Returns the shotmaps table with eventId, teamId, playerId, goalkeeperId
-    (instead of the raw nested player/goalkeeper dicts), using the shared
-    PlayerRegistry.
-    """
     event_id = row['event_id'].iloc[0]
-    home_team_id = row['home_team_id'].iloc[0]
-    away_team_id = row['away_team_id'].iloc[0]
-
-    shotmaps = json.loads(row['shotmap'].iloc[0])
-    shotmaps_df = pd.DataFrame(shotmaps['shotmap'])
-
-    shotmaps_df = shotmaps_df.copy()
-    shotmaps_df['playerId'] = shotmaps_df['player'].apply(registry.get_or_add)
-    shotmaps_df['goalkeeperId'] = shotmaps_df['goalkeeper'].apply(registry.get_or_add)
-
-    shotmaps_df['teamId'] = _team_id_from_is_home(shotmaps_df['isHome'], home_team_id, away_team_id)
-
-    cols = ['playerId', 'teamId', 'shotType', 'situation', 'playerCoordinates',
+    cols = ['eventId', 'playerId', 'teamId', 'shotType', 'situation', 'playerCoordinates',
             'bodyPart', 'goalMouthLocation', 'goalMouthCoordinates',
             'blockCoordinates', 'xg', 'xgot', 'goalkeeperId', 'time', 'addedTime']
-    shotmaps_df = shotmaps_df.reindex(columns=cols)
-    shotmaps_df.insert(0, 'eventId', event_id)
-    return shotmaps_df
+    empty_result = pd.DataFrame(columns=cols)
 
+    try:
+        home_team_id = row['home_team_id'].iloc[0]
+        away_team_id = row['away_team_id'].iloc[0]
 
+        shotmaps = json.loads(row['shotmap'].iloc[0])
+        shotmaps_df = pd.DataFrame(shotmaps['shotmap'])
+
+        shotmaps_df = shotmaps_df.copy()
+        shotmaps_df['playerId'] = shotmaps_df['player'].apply(registry.get_or_add)
+        shotmaps_df['goalkeeperId'] = shotmaps_df['goalkeeper'].apply(registry.get_or_add)
+
+        shotmaps_df['teamId'] = _team_id_from_is_home(shotmaps_df['isHome'], home_team_id, away_team_id)
+
+        keep_cols = ['playerId', 'teamId', 'shotType', 'situation', 'playerCoordinates',
+                'bodyPart', 'goalMouthLocation', 'goalMouthCoordinates',
+                'blockCoordinates', 'xg', 'xgot', 'goalkeeperId', 'time', 'addedTime']
+        shotmaps_df = shotmaps_df.reindex(columns=keep_cols)
+        shotmaps_df.insert(0, 'eventId', event_id)
+        return shotmaps_df
+    except Exception as e:
+        logger.warning(f"get_shotmaps_table: failed to parse shotmap for event_id={event_id}, returning empty table | {type(e).__name__}: {e}")
+        return empty_result
 # ---------------------------------------------------------------------------
 # Main orchestration
 # ---------------------------------------------------------------------------
 
 def transform_row(row, registry):
-    """
-    Runs every table-function for a single-row dataframe slice `row`.
-    `registry` is a PlayerRegistry shared across the whole transform_csv run.
-    Returns a dict of table_name -> DataFrame for this single match
-    (NOTE: does not include 'players' -- that's built once at the end from
-    the registry, after every row has been processed).
-    """
+    event_id = row['event_id'].iloc[0]
+
     home_players, home_players_stats, away_players, away_players_stats, formations = _get_lineups_players(row, registry)
 
-    avg_positions = json.loads(row['average_positions'].iloc[0])
-    avg_home_positions = pd.DataFrame(avg_positions['home'])
-    avg_away_positions = pd.DataFrame(avg_positions['away'])
+    try:
+        avg_positions = json.loads(row['average_positions'].iloc[0])
+        avg_home_positions = pd.DataFrame(avg_positions['home'])
+        avg_away_positions = pd.DataFrame(avg_positions['away'])
+    except Exception as e:
+        logger.warning(f"transform_row: failed to parse average_positions for event_id={event_id}, falling back to (50, 50) | {type(e).__name__}: {e}")
+        avg_home_positions = pd.DataFrame()
+        avg_away_positions = pd.DataFrame()
 
     match_df = get_match_table(row)
 
@@ -609,20 +554,13 @@ def transform_row(row, registry):
         'shotmaps': shotmaps_df,
     }
 
-
 def transform_csv(date_str, csv_dir='raw', output_dir='processed'):
-    """
-    date_str: date string used to locate the raw CSV, e.g. '2026-06-17'.
-    Reads <csv_dir>/<date_str>_match_data.csv, runs the full transform for
-    every row, concatenates each table across all matches, and writes one
-    parquet file per table to <output_dir>/<date_str>/.
-
-    A single PlayerRegistry is shared across all rows in this run, so a
-    player encountered in match 1's lineup and again in match 5's shotmap
-    only has their identity info captured once.
-    """
-    csv_path = f"{csv_dir}/{date_str}_match_data.csv"
-    df = pd.read_csv(csv_path)
+    try:
+        csv_path = f"{csv_dir}/{date_str}_match_data.csv"
+        df = pd.read_csv(csv_path)
+    except Exception as e:
+        logger.error(f"transform_csv: failed to read raw CSV at {csv_path} | {type(e).__name__}: {e}")
+        raise
 
     registry = PlayerRegistry()
 
@@ -633,13 +571,21 @@ def transform_csv(date_str, csv_dir='raw', output_dir='processed'):
         'shotmaps': [],
     }
 
+    state_df = load_state()
+    succeeded_event_ids = []
+
     for i in range(len(df)):
-        row = df.iloc[[i]]   # single-row slice, keeps it as a DataFrame
+        row = df.iloc[[i]]
+        event_id = row['event_id'].iloc[0]
         try:
             tables = transform_row(row, registry)
+            update_transform_state(state_df, event_id, status='success')
+            succeeded_event_ids.append(event_id)
+            logger.info(f"transform_row: succeeded for event_id={event_id}")
         except Exception as e:
-            event_id = row['event_id'].iloc[0]
-            print(f"Failed to transform event_id={event_id}: {e}")
+            error_message = f"{type(e).__name__}: {e}"
+            update_transform_state(state_df, event_id, status='failed', error_message=error_message)
+            logger.error(f"transform_row: failed for event_id={event_id} | {error_message}")
             continue
 
         for table_name, table_df in tables.items():
@@ -655,24 +601,32 @@ def transform_csv(date_str, csv_dir='raw', output_dir='processed'):
             combined = combined.drop_duplicates(subset='team_id').reset_index(drop=True)
         final_tables[table_name] = combined
 
-    # players is built once, at the end, from everything the registry saw
-    # across every row -- lineups, goals, substitutions, shotmaps alike.
     final_tables['players'] = registry.to_dataframe()
 
     date_output_dir = f"{output_dir}/{date_str}"
-    os.makedirs(date_output_dir, exist_ok=True)
 
-    with tempfile.TemporaryDirectory() as staging_dir:
-        for table_name, table_df in final_tables.items():
-            staging_path = f"{staging_dir}/{table_name}.parquet"
-            table_df.to_parquet(staging_path, index=False)
+    try:
+        with tempfile.TemporaryDirectory() as staging_dir:
+            for table_name, table_df in final_tables.items():
+                staging_path = f"{staging_dir}/{table_name}.parquet"
+                table_df.to_parquet(staging_path, index=False)
 
-        os.makedirs(date_output_dir, exist_ok=True)
-        for table_name in final_tables:
-            staging_path = f"{staging_dir}/{table_name}.parquet"
-            final_path = f"{date_output_dir}/{table_name}.parquet"
-            shutil.move(staging_path, final_path)
-            print(f"Wrote {final_path} ({len(final_tables[table_name])} rows)")
+            os.makedirs(date_output_dir, exist_ok=True)
+            for table_name in final_tables:
+                staging_path = f"{staging_dir}/{table_name}.parquet"
+                final_path = f"{date_output_dir}/{table_name}.parquet"
+                shutil.move(staging_path, final_path)
+                print(f"Wrote {final_path} ({len(final_tables[table_name])} rows)")
+                logger.info(f"transform_csv: wrote {final_path} ({len(final_tables[table_name])} rows)")
+    except Exception as e:
+        error_message = f"write failed: {type(e).__name__}: {e}"
+        logger.error(f"transform_csv: failed to write output tables for date_str={date_str} | {error_message}")
+        for event_id in succeeded_event_ids:
+            update_transform_state(state_df, event_id, status='failed', error_message=error_message)
+        save_state(state_df)
+        raise
+
+    save_state(state_df)
 
     return final_tables
 
@@ -685,7 +639,6 @@ def main():
     args = parser.parse_args()
 
     transform_csv(args.date_str, csv_dir=args.csv_dir, output_dir=args.output_dir)
-
 
 if __name__ == '__main__':
     main()

@@ -1,21 +1,3 @@
-"""
-Profiling / validation report for the transform pipeline.
-
-This is NOT a unit test suite (no pass/fail assertions). It runs
-transform_csv against a real raw CSV and reports, for every output table:
-    - row count
-    - per-column dtype
-    - per-column isna rate / count of missing values
-
-It also captures every row-level exception raised during the run with full
-context (event_id, exception type, message, traceback) instead of just a
-one-line print, so failures are easy to locate and diagnose.
-
-Usage:
-    python profile_transform.py 2026-06-17
-    python profile_transform.py 2026-06-17 --csv-dir raw --output-dir processed --report-dir reports
-"""
-
 import argparse
 import os
 import traceback
@@ -26,10 +8,6 @@ from transform.transform import (
     PlayerRegistry,
     transform_row,
 )
-
-import inspect
-from transform.transform import get_incidents_tables
-print(inspect.getsource(get_incidents_tables))
 
 
 def profile_table(name, df):

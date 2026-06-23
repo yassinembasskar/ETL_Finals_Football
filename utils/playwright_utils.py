@@ -6,7 +6,6 @@ from utils.logging_setup import setup_logger
 
 logger = setup_logger("playwright_utils", "logs/playwright_utils.log")
 
-
 async def capture_apis(match_url: str, api_prefix: str , headless: bool = True, wait_time: int = 20) -> List[Dict]:
     """
     Launches a Playwright browser, navigates to match_url, and captures API requests/responses.
@@ -60,36 +59,3 @@ async def capture_apis(match_url: str, api_prefix: str , headless: bool = True, 
         print(f"Error capturing APIs for {match_url}: {e}")
 
     return match_responses
-
-
-
-async def scrape_html(url: str, headless: bool = False, wait_time: int = 20) -> str:
-    """
-    Navigate to a URL using Playwright and return the page HTML.
-
-    Args:
-        url (str): The webpage URL to scrape
-        headless (bool): Whether to run browser headless
-        wait_time (int): Seconds to wait after page load
-
-    Returns:
-        str: The HTML content of the page
-    """
-    html_content = ""
-
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=headless)
-            context = await browser.new_context(viewport={"width": 1280, "height": 800})
-            page = await context.new_page()
-
-            await page.goto(url, timeout=100000)
-            await page.wait_for_timeout(wait_time * 1000)  
-
-            html_content = await page.content()
-            await browser.close()
-
-    except Exception as e:
-        logger.error(f"Error scraping HTML for {url}: {e}")
-
-    return html_content
