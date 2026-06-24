@@ -76,11 +76,11 @@ class PlayerRegistry:
 # match
 # ---------------------------------------------------------------------------
 
-def get_full_highlight(highlights_raw, event_id):
-    if pd.isna(highlights_raw):
-        return None
-
+def get_full_highlight(raw, event_id):
     try:
+        highlights_raw = raw['highlights'].iloc[0]
+        if pd.isna(highlights_raw):
+            return None
         highlights_json = json.loads(highlights_raw)
         highlights_df = pd.DataFrame(highlights_json['highlights'].tolist()
                                       if hasattr(highlights_json['highlights'], 'tolist')
@@ -110,7 +110,7 @@ def get_match_table(row):
             'slug': row['slug'].iloc[0],
             'custom_id': row['custom_id'].iloc[0],
             'sofascore_link': row['sofascore_link'].iloc[0],
-            'full_highlight_url': get_full_highlight(row['highlights'].iloc[0], event_id),
+            'full_highlight_url': get_full_highlight(row, event_id),
         }])
         logger.info(f"get_match_table: succeeded for event_id={event_id}")
         return result
@@ -372,6 +372,9 @@ def get_incidents_tables(row, registry):
         incidents = pd.DataFrame(incidents_json['incidents'])
         incidents['id'] = incidents['id'].astype('Int64')
 
+        if 'player' not in incidents.columns:
+            incidents['player'] = None
+
         substitutions = incidents.loc[
             incidents['incidentType'] == 'substitution',
             ['id', 'isHome', 'playerIn', 'playerOut', 'injury', 'time', 'addedTime']
@@ -381,6 +384,11 @@ def get_incidents_tables(row, registry):
             incidents['incidentType'] == 'card',
             ['id', 'isHome', 'incidentClass', 'time', 'addedTime', 'player']
         ].copy().rename(columns={'id': 'card_id'})
+
+        if 'assist1' not in incidents.columns:
+            incidents['assist1'] = None
+        if 'footballPassingNetworkAction' not in incidents.columns:
+            incidents['footballPassingNetworkAction'] = None
 
         goals = incidents.loc[
             incidents['incidentType'] == 'goal',
